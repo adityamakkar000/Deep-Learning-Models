@@ -40,24 +40,7 @@ class MLP:
 
         return self.output
 
-    def backward(self, y_true, prev_grad, train=True):
-        def CCE(predictions, y_true):
-            # assuming y_true is in the form of 1 hot embeddings
-            loss = -1 * np.sum(y_true * np.log(predictions), axis=(0, 1))
-            return loss
-
-        def MSE(predictions, y_true):
-            loss = (
-                0.5
-                * (1 / predictions.shape[0])
-                * np.sum(np.sum((predictions - y_true) ** 2, axis=-1), axis=0)
-            )
-            return loss
-
-        loss = CCE(self.output, y_true)  # scalar 1,
-
-        if train == False:
-            return loss
+    def backward(self, dPrev):
 
         batch_size = self.output.shape[0]
         self.dW = [i for i in range(len(self.layerWeights))]
@@ -67,7 +50,7 @@ class MLP:
         # self.dOuput = (1/batch_size) * (y_true * (self.output ** -1)) # batch_size x ouput_dim
         # self.dLayers[self.numLayers - 1] = self.dOuput * (1 - (self.output)**2) # batch_size x output_dim
 
-        self.dLayers[self.numLayers - 1] = prev_grad
+        self.dLayers[self.numLayers - 1] = dPrev
 
         for l in range(self.numLayers - 2, -1, -1):
             self.dLayers[l] = (self.dLayers[l + 1] @ self.layerWeights[l + 1]) * (
@@ -81,27 +64,44 @@ class MLP:
             self.layerWeights[l] -= self.lr * self.dW[l]
             self.layerBias[l] -= self.lr * self.dB[l].T
 
-        return loss
+        self.dPrev = self.dLayer[0] @ self.layerWeights[0]
+
+        return self.dPrev
 
 
 class LayerNorm:
 
-    def __init__(self, last_dim):
+    def __init__(self, learning_rate, last_dim):
 
+        self.lr = learning_rate
         self.gamma = np.random.rand(last_dim)
         self.beta = np.random.rand(last_dim)
 
     def __call__(self, x):
 
-        mean = np.mean(x, axis=-1)
-        std = np.std(x, axis=-1)
+        self.mean = np.mean(x, axis=-1)
+        self.std = np.std(x, axis=-1)
 
-        x = (self.gamma / std) * x + self.beta  # broadcast across batch
+        self.x = x
+
+        x = (self.gamma / self.std) * (
+            x - self.mean
+        ) + self.beta  # broadcast across batch
 
         return x
 
+    def backward(self, dPrev):
 
-# TODO backwards method
+        # prev -> (batch, dim)
+
+        dGamma = np.sum(dPrev * (self.x - self.mean) / self.std, axis=0)
+        dBeta = np.sum(dPrev, axis=0)
+        dX = self.gamma / self.std
+
+        self.beta -= self.lr * dBeta
+        self.gamma -= self.lr * dGamma
+
+        return dX
 
 
 class SelfAttention:
@@ -122,10 +122,37 @@ class SelfAttention:
         k = self.queries(x)
         v = self.queries(x)
 
-        attention = softmax(np.tril(q @ k.T) / self.queries.shape[1])
+        dotProduct = q @ k.T
+        attention = softmax(np.tril(dotProduct) / self.queries.shape[1])
         logits = attention @ v
 
+        self.attention = attention
+        self.q = q
+        self.k = k
+        self.v = v
+
         return logits
+
+    def backward(self, dPrev):
+
+        dLogits = dPrev
+
+        dAttention = dLogits @ self.v.T
+        dDotProduct = np.tril(
+            dAttention * (self.attention * (1 - self.attention)) / self.queries.shape[1]
+        )
+
+        dv = self.attention.T @ dLogits
+        dk = dDotProduct @ self.q
+        dq = dDotProduct @ self.k
+
+        self.dPrev = (
+            self.values.backward(dv)
+            + self.keys.backward(dk)
+            + self.queries.backward(dq)
+        )
+
+        return self.dPrev
 
 
 class MultiHeadSelfAttention:
@@ -134,6 +161,7 @@ class MultiHeadSelfAttention:
 
         self.lr = learning_rate
         head_size = block_dim // nheads
+        self.nheads = nheads
         self.heads = [SelfAttention(self.lr, length, head_size) for _ in range(nheads)]
 
     def __call__(self, x):
@@ -142,6 +170,22 @@ class MultiHeadSelfAttention:
         logits = np.concatenate(*logits, axis=-1)
 
         return logits
+
+    def backward(self, dPrev):
+
+        dLogits = dPrev
+        dHeads = np.split(dLogits, indices_or_sections=self.nheads, axis=-1)
+        self.dPrev = np.sum(
+            np.array(
+                [
+                    self.heads[index].backward(dHeads[index])
+                    for index in range(self.nheads)
+                ]
+            ),
+            axis=0,
+        )
+
+        return self.dPrev
 
 
 class TransformerBlock:
@@ -159,10 +203,32 @@ class TransformerBlock:
 
     def __call__(self, x):
 
-        x = x + self.feedforward1(self.MHA(self.ln1(x)))
-        x = x + self.feedforward2(self.ln2(x))
+        self.layer_norm_1 = self.ln1(x)
+        self.attention = self.MHA(self.layer_norm_1)
+        self.ff1 = self.feedforward1(self.attention)
+        self.inter = x + self.ff1
 
-        return x
+        self.layer_norm_2 = self.ln2(self.inter)
+        self.ff2 = self.feedforward2(self.layer_norm_2)
+
+        logits = self.inter + self.ff2
+
+        return logits
+
+    def backward(self, dPrev):
+
+        dLogits = dPrev
+
+        dff2 = self.feedforward2.backward(dLogits)
+        dln2 = self.ln2.backward(dff2)
+
+        dInter = dLogits + dln2
+
+        dff1 = self.feedforward1.backward(dInter)
+        dAttention = self.MHA.backward(dff1)
+        dLn1 = self.ln1.backward(dAttention)
+
+        return dLn1
 
 
 class GPT:
@@ -174,7 +240,7 @@ class GPT:
         self.embedding_table = np.random.rand(vocab_size, block_dim)
         self.pos_embedding = np.random.rand(length, block_dim)
         self.blocks = [
-            TransformerBlock(self.lr, length, nheads, block_dim) for _ in nblocks
+            TransformerBlock(self.lr, length, nheads, block_dim) for _ in range(nblocks)
         ]
         self.finalLayerNorm = LayerNorm(self.lr, block_dim)
         self.mlp = MLP(self.lr, block_dim, vocab_size)
@@ -184,6 +250,7 @@ class GPT:
         def softmax(arr):
             return np.exp(arr) / np.sum(np.exp(arr), axis=1, keepdims=True)
 
+        self.indices = x
         x = self.embedding_table[x] + self.pos_embedding
 
         for block in self.blocks:
@@ -191,7 +258,42 @@ class GPT:
 
         logits = self.mlp(self.finalLayerNorm(x))
 
-        probs = softmax(logits)
+        self.predictions = softmax(logits)
 
-        return probs
+        return self.predictions
 
+    def backward(self, y_true, train=True):
+
+        def CCE(predictions, y_true):
+            # assuming y_true is in the form of 1 hot embeddings
+            loss = -1 * np.sum(y_true * np.log(predictions), axis=(0, 1))
+            return loss
+
+        def MSE(predictions, y_true):
+            loss = (
+                0.5
+                * (1 / predictions.shape[0])
+                * np.sum(np.sum((predictions - y_true) ** 2, axis=-1), axis=0)
+            )
+            return loss
+
+        loss = CCE(self.output, y_true)  # scalar 1,
+
+        if train == False:
+          return loss
+
+        dLoss = self.output - y_true
+
+        dFinalMlp = self.mlp.backward(dLoss)
+        dFinalLayerNorm = self.finalLayerNorm.backward(dFinalMlp)
+
+        dBlock = dFinalLayerNorm
+
+        for block in reversed(self.blocks):
+            dBlock = block.backward(dBlock)
+
+        self.embedding_table[self.indices] -= self.lr * dBlock
+        self.pos_embedding -= self.lr* dBlock
+
+
+        return loss
