@@ -144,7 +144,6 @@ class LayerNorm:
         )
 
         self.aditya = dX
-        # self.gpt = dX_gpt
 
         self.beta -= self.lr * self.dBeta
         self.gamma -= self.lr * self.dGamma
@@ -431,7 +430,8 @@ class GPT:
             current_context = one_hot(np.array(current_sequence), self.vocab_size)
             current_context = np.expand_dims(current_context, axis=(0))
 
-            probs = self(current_context)[0, -1]
+            logits, probs = self(current_context)
+            probs = probs[0, -1]
             next_token = np.random.choice(
                 [i for i in range(self.vocab_size)], 1, [i for i in probs]
             )[0]
