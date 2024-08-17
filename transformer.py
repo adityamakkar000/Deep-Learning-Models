@@ -31,15 +31,9 @@ class MLP:
             total += np.sum(np.array([layer.shape[0] for layer in self.layerBias]))
         return total
 
-    def __call__(self, X, softmaxLayer=False):
-
-        def softmax(x):
-            x_max = np.max(x, axis=-1, keepdims=True)
-            exp_x = np.exp(x - x_max)
-            return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+    def __call__(self, X):
 
         self.layers[0] = X
-        self.softmax = softmaxLayer
 
         for l in range(0, self.numLayers - 1):
             self.layers[l + 1] = self.layers[l] @ self.layerWeights[l].T + (
@@ -54,9 +48,7 @@ class MLP:
             self.layerBias[self.numLayers - 1].T if self.bias == True else 0
         )
 
-        if softmaxLayer == True:
-            self.layers[self.numLayers] = softmax(self.layers[self.numLayers])
-        elif self.last_layer == True:
+        if self.last_layer == True:
             self.layers[self.numLayers] = self.layers[self.numLayers] * (
                 self.layers[self.numLayers] > 0
             )
@@ -78,7 +70,7 @@ class MLP:
 
         self.dLayers[self.numLayers - 1] = dPrev
 
-        if self.softmax == False and self.last_layer == True:
+        if self.last_layer == True:
             self.dLayers[self.numLayers - 1] = self.dLayers[self.numLayers - 1] * (
                 self.layers[self.numLayers] > 0
             )
@@ -87,6 +79,8 @@ class MLP:
             self.dLayers[l] = self.dLayers[l + 1] @ self.layerWeights[l + 1]
             if self.activation == True:
                 self.dLayers[l] = self.dLayers[l] * ((self.layers[l + 1]) > 0)
+
+        self.dPrev = self.dLayers[0] @ self.layerWeights[0]
 
         for l in range(0, self.numLayers):
 
@@ -101,8 +95,6 @@ class MLP:
                     np.sum(self.dLayers[l], axis=(0, 1)), axis=0
                 )
                 self.layerBias[l] -= self.lr * self.dB[l].T
-
-        self.dPrev = self.dLayers[0] @ self.layerWeights[0]
 
         return self.dPrev
 
@@ -132,15 +124,30 @@ class LayerNorm:
     def backward(self, dPrev):
 
         # prev -> (batch, dim)
-        dGamma = np.sum(
+        self.dGamma = np.sum(
             dPrev * (self.x - self.mean) / self.std, axis=(0, 1), keepdims=True
         )
-        dBeta = np.sum(dPrev, axis=(0, 1), keepdims=True)
+        self.dBeta = np.sum(dPrev, axis=(0, 1), keepdims=True)
 
-        dX = self.gamma / self.std
+        N = self.last_dim
 
-        self.beta -= self.lr * dBeta
-        self.gamma -= self.lr * dGamma
+        dX = (
+            dPrev * self.gamma / self.std
+            - np.sum(dPrev * self.gamma, axis=-1, keepdims=True) / (N * self.std)
+            - (self.x - self.mean)
+            / N
+            * np.sum(
+                dPrev * (self.std**-3) * self.gamma * (self.x - self.mean),
+                axis=-1,
+                keepdims=True,
+            )
+        )
+
+        self.aditya = dX
+        # self.gpt = dX_gpt
+
+        self.beta -= self.lr * self.dBeta
+        self.gamma -= self.lr * self.dGamma
 
         return dX
 
@@ -188,14 +195,14 @@ class SelfAttention:
 
         dAttention = dLogits @ self.v.transpose(0, 2, 1)
         dDotProduct = (
-            (-1 / self.q.shape[1])
-            * (self.attention * dAttention)
-            * (dAttention @ self.attention.transpose(0, 2, 1))
+            dAttention * self.attention
+            - np.sum(dAttention * self.attention, axis=-1, keepdims=True)
+            * self.attention
         )
 
         dv = self.attention.transpose(0, 2, 1) @ dLogits
-        dk = dDotProduct @ self.q
-        dq = dDotProduct @ self.k
+        dk = (1 / np.sqrt(self.q.shape[2])) * dDotProduct.transpose(0, 2, 1) @ self.q
+        dq = (1 / np.sqrt(self.q.shape[2])) * dDotProduct @ self.k
 
         self.dPrev = (
             self.values.backward(dv)
@@ -295,7 +302,8 @@ class TransformerBlock:
         dAttention = self.MHA.backward(dff1)
         dLn1 = self.ln1.backward(dAttention)
 
-        return dLn1
+        dX = dLn1 + dInter
+        return dX
 
     def get_total_params(self):
         params = (
@@ -322,9 +330,14 @@ class GPT:
             TransformerBlock(self.lr, nheads, block_dim) for _ in range(nblocks)
         ]
         self.finalLayerNorm = LayerNorm(self.lr, block_dim)
-        self.mlp = MLP(self.lr, block_dim, vocab_size)
+        self.mlp = MLP(self.lr, block_dim, vocab_size, last_layer=False)
 
     def __call__(self, x):
+
+        def softmax(x):
+            x_max = np.max(x, axis=-1, keepdims=True)
+            exp_x = np.exp(x - x_max)
+            return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
 
         self.indices = x
         x = x @ self.embedding_table + self.pos_embedding
@@ -332,15 +345,28 @@ class GPT:
         for block in self.blocks:
             x = block(x)
 
-        self.predictions = self.mlp(self.finalLayerNorm(x), softmaxLayer=True)
-
-        return self.predictions
+        self.logits = self.mlp(self.finalLayerNorm(x))
+        self.predictions = softmax(self.logits)
+        return self.logits, self.predictions
 
     def backward(self, y_true, train=True):
 
-        def CCE(predictions, y_true):
+        def CCE(logits, y_true):
             # assuming y_true is in the form of 1 hot embeddings
-            loss = -1 * np.sum(y_true * np.log(predictions))
+
+            ls = (
+                logits
+                - np.max(logits, axis=-1, keepdims=True)
+                - np.log(
+                    np.sum(
+                        np.exp(logits - np.max(logits, axis=-1, keepdims=True)),
+                        axis=-1,
+                        keepdims=True,
+                    )
+                )
+            )
+
+            loss = -1 * np.sum(y_true * ls)
             return loss
 
         def MSE(predictions, y_true):
@@ -351,7 +377,7 @@ class GPT:
             )
             return loss
 
-        loss = CCE(self.predictions, y_true)  # scalar 1,
+        loss = CCE(self.logits, y_true)  # scalar 1,
 
         if train == False:
             return loss
