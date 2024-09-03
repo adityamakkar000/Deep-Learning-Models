@@ -143,6 +143,8 @@ class LayerNorm:
             )
         )
 
+        self.aditya = dX
+
         self.beta -= self.lr * self.dBeta
         self.gamma -= self.lr * self.dGamma
 
